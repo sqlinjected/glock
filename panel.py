@@ -5,6 +5,7 @@ from pathlib import Path
 from tkinter import filedialog
 
 from cursor_lock import Bounds, Display
+from hotkey import Hotkey
 
 
 WINDOW = "#201e21"
@@ -21,9 +22,12 @@ FONT = "Segoe UI"
 
 
 class BoomchikaPanel(tk.Frame):
-    def __init__(self, master, logo_path: Path, hotkey: bool, save_game, toggle_pause):
+    def __init__(self, master, logo_path: Path, hotkey: Hotkey, hotkey_registered: bool,
+                 save_game, toggle_pause, change_hotkey):
         super().__init__(master, background=WINDOW)
         self.save_game = save_game
+        self.change_hotkey = change_hotkey
+        self.shortcut_editor: tk.Toplevel | None = None
         self.displays: tuple[Display, ...] = ()
         self.game_monitor: Bounds | None = None
         self.game_name = ""
@@ -80,12 +84,15 @@ class BoomchikaPanel(tk.Frame):
         footer = tk.Frame(self, background=BAR, padx=20, pady=9)
         footer.grid(row=4, column=0, sticky="ew")
         self.label(footer, "Alt+Tab frees the mouse", 9, color=MUTED, background=BAR).pack(side="left")
-        if hotkey:
-            keys = tk.Frame(footer, background=BAR)
-            keys.pack(side="right", padx=(8, 0))
-            self.label(keys, "Pause", 9, color=MUTED, background=BAR).pack(side="left", padx=(0, 7))
-            for key in ("Ctrl", "Alt", "F10"):
-                self.label(keys, key, 9, background=BUTTON, padx=5, pady=1).pack(side="left", padx=(0, 3))
+        keys = tk.Frame(footer, background=BAR)
+        keys.pack(side="right", padx=(8, 0))
+        self.label(keys, "Pause shortcut", 9, color=MUTED, background=BAR).pack(side="left", padx=(0, 7))
+        self.shortcut_display = self.label(keys, "", 9, background=BUTTON, padx=5, pady=1)
+        self.shortcut_display.pack(side="left", padx=(0, 6))
+        self.shortcut_button = self.button(keys, "Change", self.edit_shortcut)
+        self.shortcut_button.configure(font=(FONT, 9, "bold"), padx=7, pady=2)
+        self.shortcut_button.pack(side="left")
+        self.set_hotkey(hotkey, hotkey_registered)
 
     @staticmethod
     def label(master, text, size, *, bold=False, color=TEXT, background=WINDOW, **kwargs):
@@ -117,6 +124,81 @@ class BoomchikaPanel(tk.Frame):
         )
         if path:
             self.edit_game(Path(path).name)
+
+    def set_hotkey(self, hotkey: Hotkey, registered: bool):
+        self.hotkey = hotkey
+        label = hotkey.label if registered else f"{hotkey.label} (unavailable)"
+        self.shortcut_display.configure(text=label, foreground=TEXT if registered else AMBER)
+
+    def edit_shortcut(self):
+        if self.shortcut_editor is not None:
+            self.shortcut_editor.lift()
+            return
+
+        dialog = tk.Toplevel(self)
+        self.shortcut_editor = dialog
+        dialog.title("Pause shortcut")
+        dialog.transient(self.winfo_toplevel())
+        dialog.resizable(False, False)
+        content = tk.Frame(dialog, background=WINDOW, padx=20, pady=16)
+        content.pack(fill="both", expand=True)
+
+        self.label(content, "Key", 10, bold=True).grid(row=0, column=0, sticky="w", pady=(0, 5))
+        key = tk.StringVar(master=dialog, value=self.hotkey.key)
+        entry = tk.Entry(
+            content, textvariable=key, width=8, font=("Consolas", 11), background=SCREEN,
+            foreground=TEXT, insertbackground=AMBER, selectbackground=AMBER_SURFACE,
+            selectforeground=TEXT, relief="flat", highlightthickness=1,
+            highlightbackground=BORDER, highlightcolor=AMBER_EDGE,
+        )
+        entry.grid(row=1, column=0, sticky="w", ipady=4)
+        self.label(content, "Type a key like L or F8.", 9, color=MUTED).grid(
+            row=1, column=1, sticky="w", padx=(10, 0)
+        )
+
+        modifiers = tk.Frame(content, background=WINDOW)
+        modifiers.grid(row=2, column=0, columnspan=2, sticky="w", pady=(11, 0))
+        ctrl = tk.BooleanVar(master=dialog, value=self.hotkey.ctrl)
+        alt = tk.BooleanVar(master=dialog, value=self.hotkey.alt)
+        shift = tk.BooleanVar(master=dialog, value=self.hotkey.shift)
+        for label, variable in (("Ctrl", ctrl), ("Alt", alt), ("Shift", shift)):
+            tk.Checkbutton(
+                modifiers, text=label, variable=variable, font=(FONT, 10), background=WINDOW,
+                foreground=TEXT, activebackground=WINDOW, activeforeground=TEXT, selectcolor=AMBER_EDGE,
+                highlightthickness=1, highlightbackground=WINDOW, highlightcolor=AMBER_EDGE,
+            ).pack(side="left", padx=(0, 10))
+
+        error_label = self.label(content, "", 9, color=AMBER, wraplength=270, justify="left")
+        error_label.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 12))
+
+        def close():
+            self.shortcut_editor = None
+            dialog.destroy()
+            self.shortcut_button.focus_set()
+
+        def apply():
+            try:
+                hotkey = Hotkey(key.get(), ctrl.get(), alt.get(), shift.get())
+            except ValueError as error:
+                error_label.configure(text=str(error))
+                return
+
+            error = self.change_hotkey(hotkey)
+            if error:
+                error_label.configure(text=error)
+            else:
+                close()
+
+        actions = tk.Frame(content, background=WINDOW)
+        actions.grid(row=4, column=0, columnspan=2, sticky="e")
+        self.button(actions, "Cancel", close).pack(side="left", padx=(0, 6))
+        self.button(actions, "Save", apply, primary=True).pack(side="left")
+        dialog.protocol("WM_DELETE_WINDOW", close)
+        dialog.bind("<Escape>", lambda _event: close())
+        entry.bind("<Return>", lambda _event: apply())
+        dialog.grab_set()
+        entry.focus_set()
+        entry.selection_range(0, tk.END)
 
     def refresh(self, status, executable, paused, displays, game_monitor):
         view = (status, executable, paused, displays, game_monitor)
