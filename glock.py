@@ -1,19 +1,22 @@
 import sys
 from collections import deque
 from pathlib import Path
+from time import monotonic
 
 if sys.platform != "win32":
     raise SystemExit("glock runs on Windows.")
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import messagebox
 
-from cursor_lock import CursorLock, SingleInstance, enable_dpi_awareness
+from cursor_lock import CursorLock, SingleInstance, connected_displays, enable_dpi_awareness
+from panel import BoomchikaPanel
 from tray import TrayIcon
 
 
 APP_DIR = Path(__file__).resolve().parent
 ICON_PATH = APP_DIR / "assets" / "glock.ico"
+LOGO_PATH = APP_DIR / "assets" / "glock.png"
 SETTINGS_PATH = APP_DIR / "GameCursorLock.settings"
 DEFAULT_GAME = "legouniverse.exe"
 
@@ -34,7 +37,9 @@ class GlockApp:
         self.root = root
         self.cursor = CursorLock()
         self.executable = None
-        self.settings_open = False
+        self.panel_visible = False
+        self.displays = ()
+        self.next_display_check = 0.0
         self.paused = False
         self.closed = False
         self.timer = None
@@ -43,7 +48,7 @@ class GlockApp:
         self.tray = TrayIcon(ICON_PATH, self.tray_actions.append)
 
     def start(self):
-        self.build_settings()
+        self.build_panel()
         self.root.report_callback_exception = self.callback_error
         self.tray.start()
         try:
@@ -54,66 +59,41 @@ class GlockApp:
             messagebox.showwarning("glock", f"Could not read settings.\n\n{error}", parent=self.root)
 
         if self.executable is None:
-            self.show_settings()
+            self.show_panel()
         self.tick()
 
-    def build_settings(self):
-        self.root.title("glock")
+    def build_panel(self):
+        self.root.title("boomchikaUI")
         self.root.iconbitmap(str(ICON_PATH))
-        self.root.resizable(False, False)
-        self.root.protocol("WM_DELETE_WINDOW", self.hide_settings)
-        self.root.bind("<Escape>", lambda _event: self.hide_settings())
-
-        frame = ttk.Frame(self.root, padding=20)
-        frame.grid()
-        ttk.Label(frame, text="Game executable").grid(row=0, column=0, sticky="w", pady=(0, 5))
-
-        self.name = tk.StringVar(master=self.root)
-        self.name_entry = ttk.Entry(frame, width=34, textvariable=self.name)
-        self.name_entry.grid(row=1, column=0, sticky="ew")
-        self.name_entry.bind("<Return>", lambda _event: self.save_settings())
-        ttk.Button(frame, text="Browse…", command=self.browse).grid(row=1, column=1, padx=(8, 0))
-
-        if self.tray.hotkey_registered:
-            hint = "Alt+Tab frees the mouse. Ctrl+Alt+F10 pauses or resumes the lock."
-        else:
-            hint = "Alt+Tab frees the mouse. Use the tray menu to pause the lock."
-        ttk.Label(frame, text=hint, wraplength=340).grid(
-            row=2, column=0, columnspan=2, sticky="w", pady=(10, 15)
+        self.root.protocol("WM_DELETE_WINDOW", self.hide_panel)
+        self.root.bind("<Escape>", lambda _event: self.hide_panel())
+        self.panel = BoomchikaPanel(
+            self.root, LOGO_PATH, self.tray.hotkey_registered, self.save_game, self.toggle_pause,
         )
+        self.panel.pack(fill="both", expand=True)
+        self.root.update_idletasks()
+        self.root.minsize(self.root.winfo_reqwidth(), self.root.winfo_reqheight())
 
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=3, column=0, columnspan=2, sticky="e")
-        ttk.Button(buttons, text="Cancel", command=self.hide_settings).grid(row=0, column=0, padx=(0, 8))
-        ttk.Button(buttons, text="Start", command=self.save_settings).grid(row=0, column=1)
-
-    def show_settings(self):
-        if not self.settings_open:
-            self.settings_open = True
-            self.name.set(self.executable or DEFAULT_GAME)
-            self.update_lock()
+    def show_panel(self):
+        already_visible = self.panel_visible
         self.root.deiconify()
         self.root.lift()
-        self.name_entry.focus_set()
-        self.name_entry.selection_range(0, tk.END)
+        if not already_visible:
+            self.panel_visible = True
+            self.next_display_check = 0.0
+            self.panel.edit_game(self.executable or DEFAULT_GAME, focus=self.executable is None)
+            self.update_lock()
 
-    def hide_settings(self):
+    def hide_panel(self):
+        self.panel_visible = False
         self.root.withdraw()
-        self.settings_open = False
         self.update_lock()
 
-    def browse(self):
-        path = filedialog.askopenfilename(
-            parent=self.root, title="Choose your game", filetypes=[("Windows executables", "*.exe")]
-        )
-        if path:
-            self.name.set(Path(path).name)
-
-    def save_settings(self):
-        name = executable_name(self.name.get())
+    def save_game(self, text):
+        name = executable_name(text)
         if name is None:
-            messagebox.showwarning("glock", "Enter a game executable like legouniverse.exe.", parent=self.root)
-            self.name_entry.focus_set()
+            messagebox.showwarning("boomchikaUI", "Enter a game executable like legouniverse.exe.", parent=self.root)
+            self.panel.entry.focus_set()
             return
 
         try:
@@ -127,35 +107,40 @@ class GlockApp:
             return
 
         self.executable = name
-        self.paused = False
-        self.hide_settings()
+        self.panel.edit_game(name)
+        self.update_lock()
+
+    def toggle_pause(self):
+        if self.executable is not None:
+            self.paused = not self.paused
+            self.update_lock()
 
     def handle_tray_action(self, action: str):
         if action == "settings":
-            self.show_settings()
+            self.show_panel()
         elif action == "exit":
             self.close()
             self.root.quit()
-        elif action == "toggle" and self.can_pause():
-            self.paused = not self.paused
-
-    def can_pause(self):
-        return self.executable is not None and not self.settings_open
+        elif action == "toggle":
+            self.toggle_pause()
 
     def update_lock(self):
-        if self.settings_open:
+        if self.executable is None:
             self.cursor.release()
-            status = "Settings open"
-        elif self.executable is None:
-            self.cursor.release()
-            status = "Choose a game in Settings"
+            status = "Choose a game"
         elif self.paused:
             self.cursor.release()
             status = "Paused"
         else:
             status = self.cursor.update(self.executable)
 
-        self.tray.update(status, self.paused, self.can_pause())
+        self.tray.update(status, self.paused, self.executable is not None)
+        if self.panel_visible:
+            now = monotonic()
+            if now >= self.next_display_check:
+                self.displays = connected_displays()
+                self.next_display_check = now + 1.0
+            self.panel.refresh(status, self.executable, self.paused, self.displays, self.cursor.game_monitor)
 
     def tick(self):
         self.timer = None
