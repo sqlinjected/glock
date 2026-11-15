@@ -1,7 +1,8 @@
-"""Windows cursor confinement and single-instance support for glock."""
+"""Windows display geometry, cursor confinement, and single-instance support."""
 
 import ctypes
 from ctypes import wintypes
+from dataclasses import dataclass
 import ntpath
 
 
@@ -12,10 +13,18 @@ _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _ERROR_ALREADY_EXISTS = 183
 _CSTR_EQUAL = 2
 _MONITOR_DEFAULTTONULL = 0
+_MONITORINFOF_PRIMARY = 1
 _PER_MONITOR_AWARE = -3
 _PER_MONITOR_AWARE_V2 = -4
 
 Bounds = tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class Display:
+    name: str
+    bounds: Bounds
+    primary: bool
 
 
 class _MonitorInfo(ctypes.Structure):
@@ -24,7 +33,13 @@ class _MonitorInfo(ctypes.Structure):
         ("monitor", wintypes.RECT),
         ("work_area", wintypes.RECT),
         ("flags", wintypes.DWORD),
+        ("device_name", wintypes.WCHAR * 32),
     ]
+
+
+_MonitorCallback = ctypes.WINFUNCTYPE(
+    wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC, wintypes.LPRECT, wintypes.LPARAM,
+)
 
 
 def _bind(dll, name, result, *arguments):
@@ -43,6 +58,10 @@ _get_window_monitor = _bind(
 )
 _get_monitor_info = _bind(
     _user32, "GetMonitorInfoW", wintypes.BOOL, wintypes.HMONITOR, ctypes.POINTER(_MonitorInfo)
+)
+_enum_display_monitors = _bind(
+    _user32, "EnumDisplayMonitors", wintypes.BOOL,
+    wintypes.HDC, wintypes.LPRECT, _MonitorCallback, wintypes.LPARAM,
 )
 _get_clip = _bind(_user32, "GetClipCursor", wintypes.BOOL, wintypes.LPRECT)
 _set_clip = _bind(_user32, "ClipCursor", wintypes.BOOL, wintypes.LPRECT)
@@ -121,15 +140,44 @@ def _bounds(rect: wintypes.RECT) -> Bounds:
     return (rect.left, rect.top, rect.right, rect.bottom)
 
 
-def _monitor_bounds(window: int) -> Bounds | None:
-    monitor = _get_window_monitor(window, _MONITOR_DEFAULTTONULL)
+def _monitor_info(monitor: int | None) -> _MonitorInfo | None:
     if not monitor:
         return None
 
     info = _MonitorInfo(size=ctypes.sizeof(_MonitorInfo))
-    if _get_monitor_info(monitor, ctypes.byref(info)):
-        return _bounds(info.monitor)
-    return None
+    if not _get_monitor_info(monitor, ctypes.byref(info)):
+        return None
+
+    rect = info.monitor
+    return info if rect.left < rect.right and rect.top < rect.bottom else None
+
+
+def _monitor_bounds(window: int) -> Bounds | None:
+    info = _monitor_info(_get_window_monitor(window, _MONITOR_DEFAULTTONULL))
+    return _bounds(info.monitor) if info is not None else None
+
+
+def connected_displays() -> tuple[Display, ...]:
+    """Return each desktop display area in physical pixels, primary first."""
+    displays: dict[Bounds, Display] = {}
+
+    @_MonitorCallback
+    def add_display(monitor, _device_context, _rect, _data):
+        info = _monitor_info(monitor)
+        if info is not None:
+            bounds = _bounds(info.monitor)
+            primary = bool(info.flags & _MONITORINFOF_PRIMARY)
+            # Mirrored displays can refer to the same desktop area.
+            if bounds not in displays or primary:
+                device = info.device_name.removeprefix("\\\\.\\")
+                number = device.upper().removeprefix("DISPLAY")
+                name = f"Display {number}" if number.isdecimal() else device or "Display"
+                displays[bounds] = Display(name, bounds, primary)
+        return True
+
+    if not _enum_display_monitors(None, None, add_display, 0):
+        return ()
+    return tuple(sorted(displays.values(), key=lambda display: (not display.primary, display.bounds)))
 
 
 def _read_clip() -> Bounds | None:
@@ -151,6 +199,11 @@ class CursorLock:
         self._focused_process: tuple[int, int] | None = None
         self._focused_exe: str | None = None
         self._applied_clip: Bounds | None = None
+        self._game_monitor: Bounds | None = None
+
+    @property
+    def game_monitor(self) -> Bounds | None:
+        return self._game_monitor
 
     def _focused_game(self, executable: str) -> int | None:
         window = _get_foreground_window()
@@ -179,8 +232,13 @@ class CursorLock:
 
         monitor = _monitor_bounds(game)
         current = _read_clip()
-        if monitor is None or current is None or _get_foreground_window() != game:
+        if monitor is None or _get_foreground_window() != game:
             self.release()
+            return "Could not lock cursor"
+
+        self._game_monitor = monitor
+        if current is None:
+            self._release_clip()
             return "Could not lock cursor"
 
         if current != self._applied_clip:
@@ -196,10 +254,14 @@ class CursorLock:
             self._applied_clip = monitor
             return "Cursor locked"
 
-        self.release()
+        self._release_clip()
         return "Could not lock cursor"
 
     def release(self) -> None:
+        self._game_monitor = None
+        self._release_clip()
+
+    def _release_clip(self) -> None:
         if self._applied_clip is None:
             return
 
