@@ -5,6 +5,8 @@ from collections.abc import Callable
 from ctypes import wintypes as win
 from pathlib import Path
 
+from hotkey import DEFAULT_HOTKEY, Hotkey
+
 
 _user32 = ct.WinDLL("user32", use_last_error=True)
 _kernel32 = ct.WinDLL("kernel32", use_last_error=True)
@@ -13,6 +15,8 @@ _shell32 = ct.WinDLL("shell32", use_last_error=True)
 _WINDOW_CLASS = "glock.TrayIcon"
 _ICON_ID = 1
 _HOTKEY_ID = 1
+_ALTERNATE_HOTKEY_ID = 2
+_HOTKEY_MODIFIER_MASK = 0x000F
 _WM_TRAY_ICON = 0x8001
 _WM_HOTKEY = 0x0312
 _WM_CLOSE = 0x0010
@@ -20,8 +24,6 @@ _WM_CONTEXTMENU = 0x007B
 _WM_LBUTTONDBLCLK = 0x0203
 _WM_RBUTTONUP = 0x0205
 _NIN_KEYSELECT = 0x0401
-_CTRL_ALT_NO_REPEAT = 0x0001 | 0x0002 | 0x4000
-_VK_F10 = 0x79
 
 _NIM_ADD = 0
 _NIM_MODIFY = 1
@@ -127,7 +129,9 @@ _post_message = _bind(_user32, "PostMessageW", win.BOOL, win.HWND, win.UINT, win
 class TrayIcon:
     """Manage the icon on the main thread. The callback should only enqueue actions."""
 
-    def __init__(self, icon_path: Path, on_action: Callable[[str], None]) -> None:
+    def __init__(
+        self, icon_path: Path, on_action: Callable[[str], None], hotkey: Hotkey = DEFAULT_HOTKEY,
+    ) -> None:
         self._on_action = on_action
         self._status = "Starting"
         self._paused = False
@@ -138,6 +142,8 @@ class TrayIcon:
         self._hwnd = None
         self._icon = None
         self._class_atom = 0
+        self._hotkey_id = _HOTKEY_ID
+        self.hotkey = hotkey
         self.hotkey_registered = False
         self._module = _get_module(None)
         self._taskbar_created = _register_message("TaskbarCreated")
@@ -169,7 +175,7 @@ class TrayIcon:
                 raise ct.WinError(ct.get_last_error())
 
             self.hotkey_registered = bool(
-                _register_hotkey(self._hwnd, _HOTKEY_ID, _CTRL_ALT_NO_REPEAT, _VK_F10)
+                _register_hotkey(self._hwnd, self._hotkey_id, hotkey.modifiers, hotkey.virtual_key)
             )
         except BaseException:
             self.close()
@@ -190,13 +196,39 @@ class TrayIcon:
             if self._visible:
                 self._notify(_NIM_MODIFY, _NIF_TIP | _NIF_SHOWTIP)
 
+    def change_hotkey(self, hotkey: Hotkey, persist: Callable[[], None] | None = None) -> bool:
+        """Reserve and save a shortcut before releasing the current one."""
+        if not self._hwnd:
+            return False
+        if self.hotkey_registered and hotkey == self.hotkey:
+            if persist is not None:
+                persist()
+            return True
+
+        candidate_id = _ALTERNATE_HOTKEY_ID if self._hotkey_id == _HOTKEY_ID else _HOTKEY_ID
+        if not _register_hotkey(self._hwnd, candidate_id, hotkey.modifiers, hotkey.virtual_key):
+            return False
+        try:
+            if persist is not None:
+                persist()
+        except BaseException:
+            _unregister_hotkey(self._hwnd, candidate_id)
+            raise
+
+        if self.hotkey_registered:
+            _unregister_hotkey(self._hwnd, self._hotkey_id)
+        self._hotkey_id = candidate_id
+        self.hotkey = hotkey
+        self.hotkey_registered = True
+        return True
+
     def close(self) -> None:
         self._started = False
         if self._visible:
             self._notify(_NIM_DELETE)
             self._visible = False
         if self.hotkey_registered:
-            _unregister_hotkey(self._hwnd, _HOTKEY_ID)
+            _unregister_hotkey(self._hwnd, self._hotkey_id)
             self.hotkey_registered = False
         if self._hwnd:
             _destroy_window(self._hwnd)
@@ -231,8 +263,14 @@ class TrayIcon:
             elif event in (_WM_LBUTTONDBLCLK, _NIN_KEYSELECT):
                 self._on_action("settings")
             return 0
-        if message == _WM_HOTKEY and wparam == _HOTKEY_ID:
-            self._on_action("toggle")
+        if message == _WM_HOTKEY:
+            # A retired registration's message can still be queued when its ID is reused.
+            if (
+                self.hotkey_registered and wparam == self._hotkey_id
+                and (lparam & _HOTKEY_MODIFIER_MASK) == (self.hotkey.modifiers & _HOTKEY_MODIFIER_MASK)
+                and ((lparam >> 16) & 0xFFFF) == self.hotkey.virtual_key
+            ):
+                self._on_action("toggle")
             return 0
         if message == _WM_CLOSE:
             self._on_action("exit")
@@ -256,7 +294,7 @@ class TrayIcon:
 
             pause_label = "Resume" if self._paused else "Pause"
             if self.hotkey_registered:
-                pause_label += "\tCtrl+Alt+F10"
+                pause_label += f"\t{self.hotkey.label}"
             pause_flags = _MF_STRING if self._can_pause else _MF_STRING | _MF_GRAYED
             _append_menu(menu, pause_flags, _TOGGLE, pause_label)
             _append_menu(menu, _MF_STRING, _EXIT, "Exit")
