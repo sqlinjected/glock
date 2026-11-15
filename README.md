@@ -1,6 +1,6 @@
 # glock
 
-Made this to keep my mouse on the game screen while playing LEGO Universe with two monitors.
+Made this to keep my mouse on the monitor screen ``PRIMARILY`` while playing LEGO Universe with two monitors.
 
 ## Run it
 
