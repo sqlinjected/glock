@@ -10,6 +10,7 @@ import tkinter as tk
 from tkinter import messagebox
 
 from cursor_lock import CursorLock, SingleInstance, connected_displays, enable_dpi_awareness
+from hotkey import DEFAULT_HOTKEY, Hotkey, parse_hotkey
 from panel import BoomchikaPanel
 from tray import TrayIcon
 
@@ -18,6 +19,7 @@ APP_DIR = Path(__file__).resolve().parent
 ICON_PATH = APP_DIR / "assets" / "glock.ico"
 LOGO_PATH = APP_DIR / "assets" / "glock.png"
 SETTINGS_PATH = APP_DIR / "GameCursorLock.settings"
+HOTKEY_PATH = APP_DIR / "glock.hotkey"
 DEFAULT_GAME = "legouniverse.exe"
 
 
@@ -30,6 +32,12 @@ def executable_name(text: str) -> str | None:
     if not name.lower().endswith(".exe"):
         name += ".exe"
     return name if len(name.encode("utf-16-le")) <= 510 else None
+
+
+def write_setting(path: Path, value: str):
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(value + "\n", encoding="utf-8")
+    temporary.replace(path)
 
 
 class GlockApp:
@@ -45,7 +53,19 @@ class GlockApp:
         self.timer = None
         self.tray_actions = deque()
         # The native window callback runs inside Tk's message pump. Handle its actions on a Tk timer.
-        self.tray = TrayIcon(ICON_PATH, self.tray_actions.append)
+        self.tray = TrayIcon(ICON_PATH, self.tray_actions.append, self.load_hotkey())
+
+    def load_hotkey(self) -> Hotkey:
+        try:
+            return parse_hotkey(HOTKEY_PATH.read_text(encoding="utf-8-sig"))
+        except FileNotFoundError:
+            pass
+        except (OSError, UnicodeError, ValueError) as error:
+            messagebox.showwarning(
+                "boomchikaUI", f"Using {DEFAULT_HOTKEY.label} for now. Could not load the saved shortcut.\n\n{error}",
+                parent=self.root,
+            )
+        return DEFAULT_HOTKEY
 
     def start(self):
         self.build_panel()
@@ -68,7 +88,8 @@ class GlockApp:
         self.root.protocol("WM_DELETE_WINDOW", self.hide_panel)
         self.root.bind("<Escape>", lambda _event: self.hide_panel())
         self.panel = BoomchikaPanel(
-            self.root, LOGO_PATH, self.tray.hotkey_registered, self.save_game, self.toggle_pause,
+            self.root, LOGO_PATH, self.tray.hotkey, self.tray.hotkey_registered,
+            self.save_game, self.toggle_pause, self.save_hotkey,
         )
         self.panel.pack(fill="both", expand=True)
         self.root.update_idletasks()
@@ -97,9 +118,7 @@ class GlockApp:
             return
 
         try:
-            temporary = SETTINGS_PATH.with_suffix(".settings.tmp")
-            temporary.write_text(name + "\n", encoding="utf-8")
-            temporary.replace(SETTINGS_PATH)
+            write_setting(SETTINGS_PATH, name)
         except OSError as error:
             messagebox.showerror(
                 "glock", f"Could not save settings next to glock.py.\n\n{error}", parent=self.root
@@ -109,6 +128,15 @@ class GlockApp:
         self.executable = name
         self.panel.edit_game(name)
         self.update_lock()
+
+    def save_hotkey(self, hotkey: Hotkey) -> str | None:
+        try:
+            if not self.tray.change_hotkey(hotkey, lambda: write_setting(HOTKEY_PATH, hotkey.label)):
+                return f"{hotkey.label} is unavailable. Try another shortcut."
+        except OSError as error:
+            return f"Could not save the shortcut. {error}"
+        self.panel.set_hotkey(self.tray.hotkey, self.tray.hotkey_registered)
+        return None
 
     def toggle_pause(self):
         if self.executable is not None:
